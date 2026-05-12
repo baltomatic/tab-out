@@ -253,11 +253,13 @@ async function getSavedTabs() {
 
   // Migration for old format
   if (allData.deferred && Array.isArray(allData.deferred)) {
+    const batchUpdate = Object.create(null);
     for (const item of allData.deferred) {
-      if (!item.id) item.id = Date.now().toString() + Math.random().toString().slice(2);
+      if (!item.id) item.id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Date.now().toString() + Math.random().toString().slice(2);
       deferred.push(item);
-      await chrome.storage.local.set({ [`deferred_${item.id}`]: item });
+      batchUpdate[`deferred_${item.id}`] = item;
     }
+    await chrome.storage.local.set(batchUpdate);
     await chrome.storage.local.remove('deferred'); // Remove old key
   }
 
@@ -805,19 +807,30 @@ function checkTabOutDupes() {
    ---------------------------------------------------------------- */
 
 function buildOverflowChips(hiddenTabs, urlCounts = Object.create(null)) {
-  const hiddenChips = hiddenTabs.map(tab => {
-    const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
-    const count    = urlCounts[tab.url] || 1;
-    const dupeTag  = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
+  const chipsHtml = hiddenTabs.map(tab => {
+    let label = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
+    try {
+      const parsed = new URL(tab.url);
+      if (parsed.hostname === 'localhost' && parsed.port) label = `${parsed.port} ${label}`;
+    } catch {}
+
+    const count = urlCounts[tab.url] || 1;
     const chipClass = count > 1 ? ' chip-has-dupes' : '';
-    const safeUrl   = (tab.url || '').replace(/"/g, '&quot;');
+    const safeUrl = (tab.url || '').replace(/"/g, '&quot;');
     const safeTitle = label.replace(/"/g, '&quot;');
     let domain = '';
     try { domain = new URL(tab.url).hostname; } catch {}
     const faviconUrl = domain ? `https://www.google.com/s2/favicons?domain=${domain}&sz=16` : '';
+
+    // Instead of template literal, we build raw HTML safely or return a string for now,
+    // because buildOverflowChips is inserted via innerHTML.
+    // However, to be fully safe, we should build it like this:
+    const safeLabel = label.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const dupeTag = count > 1 ? ` <span class="chip-dupe-badge">(${count}x)</span>` : '';
+
     return `<div class="page-chip clickable${chipClass}" data-action="focus-tab" data-tab-url="${safeUrl}" title="${safeTitle}">
       ${faviconUrl ? `<img class="chip-favicon" src="${faviconUrl}" alt="" onerror="this.style.display='none'">` : ''}
-      <span class="chip-text">${label}</span>${dupeTag}
+      <span class="chip-text">${safeLabel}</span>${dupeTag}
       <div class="chip-actions">
         <button class="chip-action chip-save" data-action="defer-single-tab" data-tab-url="${safeUrl}" data-tab-title="${safeTitle}" title="Save for later">
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" /></svg>
@@ -830,10 +843,11 @@ function buildOverflowChips(hiddenTabs, urlCounts = Object.create(null)) {
   }).join('');
 
   return `
-    <div class="page-chips-overflow" style="display:none">${hiddenChips}</div>
-    <div class="page-chip page-chip-overflow clickable" data-action="expand-chips">
-      <span class="chip-text">+${hiddenTabs.length} more</span>
-    </div>`;
+    <div class="page-chips-overflow" style="display:none;">${chipsHtml}</div>
+    <div class="page-chip clickable overflow-trigger" data-action="expand-chips">
+      +${hiddenTabs.length} more...
+    </div>
+  `;
 }
 
 
