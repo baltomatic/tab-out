@@ -226,16 +226,18 @@ async function closeTabOutDupes() {
  * @param {{ url: string, title: string }} tab
  */
 async function saveTabForLater(tab) {
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  deferred.push({
-    id:        Date.now().toString(),
+  // Use crypto.randomUUID() for strong unique IDs instead of Date.now() to prevent collisions
+  const id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Date.now().toString() + Math.random().toString().slice(2);
+  const key = `deferred_${id}`;
+  const data = {
+    id:        id,
     url:       tab.url,
     title:     tab.title,
     savedAt:   new Date().toISOString(),
     completed: false,
     dismissed: false,
-  });
-  await chrome.storage.local.set({ deferred });
+  };
+  await chrome.storage.local.set({ [key]: data });
 }
 
 /**
@@ -246,8 +248,31 @@ async function saveTabForLater(tab) {
  * Splits into active (not completed) and archived (completed).
  */
 async function getSavedTabs() {
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
+  const allData = await chrome.storage.local.get(null);
+  const deferred = [];
+
+  // Migration for old format
+  if (allData.deferred && Array.isArray(allData.deferred)) {
+    for (const item of allData.deferred) {
+      if (!item.id) item.id = Date.now().toString() + Math.random().toString().slice(2);
+      deferred.push(item);
+      await chrome.storage.local.set({ [`deferred_${item.id}`]: item });
+    }
+    await chrome.storage.local.remove('deferred'); // Remove old key
+  }
+
+  // Read all deferred_* keys
+  for (const [key, value] of Object.entries(allData)) {
+    if (key.startsWith('deferred_')) {
+      deferred.push(value);
+    }
+  }
+
   const visible = deferred.filter(t => !t.dismissed);
+
+  // Sort by savedAt descending so newest is first
+  visible.sort((a, b) => new Date(b.savedAt) - new Date(a.savedAt));
+
   return {
     active:   visible.filter(t => !t.completed),
     archived: visible.filter(t => t.completed),
@@ -260,12 +285,13 @@ async function getSavedTabs() {
  * Marks a saved tab as completed (checked off). It moves to the archive.
  */
 async function checkOffSavedTab(id) {
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  const tab = deferred.find(t => t.id === id);
+  const key = `deferred_${id}`;
+  const data = await chrome.storage.local.get(key);
+  const tab = data[key];
   if (tab) {
     tab.completed = true;
     tab.completedAt = new Date().toISOString();
-    await chrome.storage.local.set({ deferred });
+    await chrome.storage.local.set({ [key]: tab });
   }
 }
 
@@ -275,14 +301,35 @@ async function checkOffSavedTab(id) {
  * Marks a saved tab as dismissed (removed from all lists).
  */
 async function dismissSavedTab(id) {
-  const { deferred = [] } = await chrome.storage.local.get('deferred');
-  const tab = deferred.find(t => t.id === id);
+  const key = `deferred_${id}`;
+  const data = await chrome.storage.local.get(key);
+  const tab = data[key];
   if (tab) {
     tab.dismissed = true;
-    await chrome.storage.local.set({ deferred });
+    await chrome.storage.local.set({ [key]: tab });
   }
 }
 
+
+
+/* ----------------------------------------------------------------
+   DOM HELPERS (Replaces innerHTML to prevent DOM XSS)
+   ---------------------------------------------------------------- */
+function createElement(tag, className, textContent, attributes = {}) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (textContent) el.textContent = textContent;
+  for (const [key, value] of Object.entries(attributes)) {
+    el.setAttribute(key, value);
+  }
+  return el;
+}
+
+function createIcon(svgString) {
+  const span = document.createElement('span');
+  span.innerHTML = svgString; // Safe: only uses hardcoded SVG strings from ICONS
+  return span.firstElementChild;
+}
 
 /* ----------------------------------------------------------------
    UI HELPERS
@@ -454,17 +501,17 @@ function checkAndShowEmptyState() {
   const remaining = missionsEl.querySelectorAll('.mission-card:not(.closing)').length;
   if (remaining > 0) return;
 
-  missionsEl.innerHTML = `
-    <div class="missions-empty-state">
-      <div class="empty-checkmark">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round" d="m4.5 12.75 6 6 9-13.5" />
-        </svg>
-      </div>
-      <div class="empty-title">Inbox zero, but for tabs.</div>
-      <div class="empty-subtitle">You're free.</div>
-    </div>
-  `;
+  missionsEl.innerHTML = '';
+  const emptyState = createElement('div', 'missions-empty-state');
+
+  const checkmark = createElement('div', 'empty-checkmark');
+  checkmark.appendChild(createIcon(`<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="m4.5 12.75 6 6 9-13.5" /></svg>`));
+  emptyState.appendChild(checkmark);
+
+  emptyState.appendChild(createElement('div', 'empty-title', 'Inbox zero, but for tabs.'));
+  emptyState.appendChild(createElement('div', 'empty-subtitle', "You're free."));
+
+  missionsEl.appendChild(emptyState);
 
   const countEl = document.getElementById('openTabsSectionCount');
   if (countEl) countEl.textContent = '0 domains';
@@ -757,7 +804,7 @@ function checkTabOutDupes() {
    OVERFLOW CHIPS ("+N more" expand button in domain cards)
    ---------------------------------------------------------------- */
 
-function buildOverflowChips(hiddenTabs, urlCounts = {}) {
+function buildOverflowChips(hiddenTabs, urlCounts = Object.create(null)) {
   const hiddenChips = hiddenTabs.map(tab => {
     const label    = cleanTitle(smartTitle(stripTitleNoise(tab.title || ''), tab.url), '');
     const count    = urlCounts[tab.url] || 1;
@@ -807,7 +854,7 @@ function renderDomainCard(group) {
   const stableId  = 'domain-' + group.domain.replace(/[^a-z0-9]/g, '-');
 
   // Count duplicates (exact URL match)
-  const urlCounts = {};
+  const urlCounts = Object.create(null); // Prevent prototype pollution via malicious URLs
   for (const tab of tabs) urlCounts[tab.url] = (urlCounts[tab.url] || 0) + 1;
   const dupeUrls   = Object.entries(urlCounts).filter(([, c]) => c > 1);
   const hasDupes   = dupeUrls.length > 0;
@@ -933,7 +980,8 @@ async function renderDeferredColumn() {
     // Render active checklist items
     if (active.length > 0) {
       countEl.textContent = `${active.length} item${active.length !== 1 ? 's' : ''}`;
-      list.innerHTML = active.map(item => renderDeferredItem(item)).join('');
+      list.innerHTML = '';
+      active.forEach(item => list.appendChild(renderDeferredItem(item)));
       list.style.display = 'block';
       empty.style.display = 'none';
     } else {
@@ -945,7 +993,8 @@ async function renderDeferredColumn() {
     // Render archive section
     if (archived.length > 0) {
       archiveCountEl.textContent = `(${archived.length})`;
-      archiveList.innerHTML = archived.map(item => renderArchiveItem(item)).join('');
+      archiveList.innerHTML = '';
+      archived.forEach(item => archiveList.appendChild(renderArchiveItem(item)));
       archiveEl.style.display = 'block';
     } else {
       archiveEl.style.display = 'none';
@@ -964,27 +1013,53 @@ async function renderDeferredColumn() {
  * domain, time ago, dismiss button.
  */
 function renderDeferredItem(item) {
+  const itemDiv = createElement('div', 'deferred-item', '', { 'data-deferred-id': item.id });
+
+  const checkbox = createElement('input', 'deferred-checkbox', '', {
+    'type': 'checkbox',
+    'data-action': 'check-deferred',
+    'data-deferred-id': item.id
+  });
+  itemDiv.appendChild(checkbox);
+
+  const infoDiv = createElement('div', 'deferred-info');
+
+  const titleA = createElement('a', 'deferred-title', '', {
+    'href': item.url,
+    'target': '_blank',
+    'rel': 'noopener',
+    'title': item.title || item.url
+  });
+
   let domain = '';
   try { domain = new URL(item.url).hostname.replace(/^www\./, ''); } catch {}
-  const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=16`;
-  const ago = timeAgo(item.savedAt);
+  if (domain) {
+    const fav = createElement('img', '', '', {
+      'src': `https://www.google.com/s2/favicons?domain=${domain}&sz=16`,
+      'alt': ''
+    });
+    fav.style.cssText = "width:14px;height:14px;vertical-align:-2px;margin-right:4px";
+    fav.onerror = () => fav.style.display = 'none';
+    titleA.appendChild(fav);
+  }
+  titleA.appendChild(document.createTextNode(item.title || item.url));
+  infoDiv.appendChild(titleA);
 
-  return `
-    <div class="deferred-item" data-deferred-id="${item.id}">
-      <input type="checkbox" class="deferred-checkbox" data-action="check-deferred" data-deferred-id="${item.id}">
-      <div class="deferred-info">
-        <a href="${item.url}" target="_blank" rel="noopener" class="deferred-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
-          <img src="${faviconUrl}" alt="" style="width:14px;height:14px;vertical-align:-2px;margin-right:4px" onerror="this.style.display='none'">${item.title || item.url}
-        </a>
-        <div class="deferred-meta">
-          <span>${domain}</span>
-          <span>${ago}</span>
-        </div>
-      </div>
-      <button class="deferred-dismiss" data-action="dismiss-deferred" data-deferred-id="${item.id}" title="Dismiss">
-        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-      </button>
-    </div>`;
+  const metaDiv = createElement('div', 'deferred-meta');
+  metaDiv.appendChild(createElement('span', '', domain));
+  metaDiv.appendChild(createElement('span', '', timeAgo(item.savedAt)));
+  infoDiv.appendChild(metaDiv);
+  itemDiv.appendChild(infoDiv);
+
+  const dismissBtn = createElement('button', 'deferred-dismiss', '', {
+    'data-action': 'dismiss-deferred',
+    'data-deferred-id': item.id,
+    'title': 'Dismiss'
+  });
+  dismissBtn.appendChild(createIcon(`<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>`));
+  itemDiv.appendChild(dismissBtn);
+
+  return itemDiv;
 }
 
 /**
@@ -993,14 +1068,20 @@ function renderDeferredItem(item) {
  * Builds HTML for one completed/archived item (simpler: just title + date).
  */
 function renderArchiveItem(item) {
+  const itemDiv = createElement('div', 'archive-item');
+
+  const titleA = createElement('a', 'archive-item-title', item.title || item.url, {
+    'href': item.url,
+    'target': '_blank',
+    'rel': 'noopener',
+    'title': item.title || item.url
+  });
+  itemDiv.appendChild(titleA);
+
   const ago = item.completedAt ? timeAgo(item.completedAt) : timeAgo(item.savedAt);
-  return `
-    <div class="archive-item">
-      <a href="${item.url}" target="_blank" rel="noopener" class="archive-item-title" title="${(item.title || '').replace(/"/g, '&quot;')}">
-        ${item.title || item.url}
-      </a>
-      <span class="archive-item-date">${ago}</span>
-    </div>`;
+  itemDiv.appendChild(createElement('span', 'archive-item-date', ago));
+
+  return itemDiv;
 }
 
 
@@ -1064,7 +1145,7 @@ async function renderStaticDashboard() {
   }
 
   domainGroups = [];
-  const groupMap    = {};
+  const groupMap = Object.create(null); // Prevent prototype pollution
   const landingTabs = [];
 
   // Custom group rules from config.local.js (if any)
@@ -1150,8 +1231,14 @@ async function renderStaticDashboard() {
 
   if (domainGroups.length > 0 && openTabsSection) {
     if (openTabsSectionTitle) openTabsSectionTitle.textContent = 'Open tabs';
-    openTabsSectionCount.innerHTML = `${domainGroups.length} domain${domainGroups.length !== 1 ? 's' : ''} &nbsp;&middot;&nbsp; <button class="action-btn close-tabs" data-action="close-all-open-tabs" style="font-size:11px;padding:3px 10px;">${ICONS.close} Close all ${realTabs.length} tabs</button>`;
-    openTabsMissionsEl.innerHTML = domainGroups.map(g => renderDomainCard(g)).join('');
+    openTabsSectionCount.innerHTML = '';
+    openTabsSectionCount.appendChild(document.createTextNode(`${domainGroups.length} domain${domainGroups.length !== 1 ? 's' : ''}  ·  `));
+    const btnCloseAllTabs = createElement('button', 'action-btn close-tabs', ` Close all ${realTabs.length} tabs`, {'data-action': 'close-all-open-tabs'});
+    btnCloseAllTabs.style.cssText = 'font-size:11px;padding:3px 10px;';
+    btnCloseAllTabs.prepend(createIcon(ICONS.close));
+    openTabsSectionCount.appendChild(btnCloseAllTabs);
+    openTabsMissionsEl.innerHTML = '';
+    domainGroups.forEach(g => openTabsMissionsEl.appendChild(renderDomainCard(g)));
     openTabsSection.style.display = 'block';
   } else if (openTabsSection) {
     openTabsSection.style.display = 'none';
@@ -1458,7 +1545,8 @@ document.addEventListener('input', async (e) => {
 
     if (q.length < 2) {
       // Show all archived items
-      archiveList.innerHTML = archived.map(item => renderArchiveItem(item)).join('');
+      archiveList.innerHTML = '';
+      archived.forEach(item => archiveList.appendChild(renderArchiveItem(item)));
       return;
     }
 
@@ -1468,8 +1556,14 @@ document.addEventListener('input', async (e) => {
       (item.url  || '').toLowerCase().includes(q)
     );
 
-    archiveList.innerHTML = results.map(item => renderArchiveItem(item)).join('')
-      || '<div style="font-size:12px;color:var(--muted);padding:8px 0">No results</div>';
+    archiveList.innerHTML = '';
+    if (results.length === 0) {
+      const noRes = createElement('div', '', 'No results');
+      noRes.style.cssText = 'font-size:12px;color:var(--muted);padding:8px 0';
+      archiveList.appendChild(noRes);
+    } else {
+      results.forEach(item => archiveList.appendChild(renderArchiveItem(item)));
+    }
   } catch (err) {
     console.warn('[tab-out] Archive search failed:', err);
   }
